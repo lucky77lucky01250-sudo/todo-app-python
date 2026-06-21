@@ -8,7 +8,7 @@ from google.oauth2.service_account import Credentials
 
 # ===== 設定 =====
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-HEADER = ["id", "title", "content", "due", "done"]
+HEADER = ["ID", "タイトル", "内容", "期日", "状態"]
 
 st.set_page_config(page_title="Todoリスト", page_icon="✅", layout="centered")
 
@@ -75,15 +75,15 @@ with tab_list:
     else:
         st.caption(f"全 {len(df)} 件")
         for _, row in df.iterrows():
-            done = str(row["done"]) == "完了"
+            done = str(row["状態"]) == "完了"
             mark = "✅" if done else "⬜️"
-            title = f"~~{row['title']}~~" if done else f"**{row['title']}**"
+            title = f"~~{row['タイトル']}~~" if done else f"**{row['タイトル']}**"
             with st.container(border=True):
                 st.markdown(f"{mark} {title}")
-                if row["content"]:
-                    st.write(row["content"])
-                if row["due"]:
-                    st.caption(f"📅 期日: {row['due']}")
+                if row["内容"]:
+                    st.write(row["内容"])
+                if row["期日"]:
+                    st.caption(f"📅 期日: {row['期日']}")
 
 # --- 新規登録ページ ---
 with tab_add:
@@ -106,21 +106,21 @@ with tab_edit:
     if df.empty:
         st.info("編集できるやることがありません。")
     else:
-        options = {f"{r['title']} ({r['id']})": r["id"] for _, r in df.iterrows()}
+        options = {f"{r['タイトル']} ({r['ID']})": r["ID"] for _, r in df.iterrows()}
         selected_label = st.selectbox("編集するやることを選択", list(options.keys()))
         todo_id = options[selected_label]
-        target = df[df["id"] == todo_id].iloc[0]
+        target = df[df["ID"] == todo_id].iloc[0]
 
         try:
-            due_value = datetime.date.fromisoformat(str(target["due"]))
+            due_value = datetime.date.fromisoformat(str(target["期日"]))
         except ValueError:
             due_value = datetime.date.today()
 
         with st.form("edit_form"):
-            e_title = st.text_input("タイトル *", value=target["title"])
-            e_content = st.text_area("内容", value=target["content"])
+            e_title = st.text_input("タイトル *", value=target["タイトル"])
+            e_content = st.text_area("内容", value=target["内容"])
             e_due = st.date_input("期日", value=due_value)
-            e_done = st.checkbox("完了にする", value=str(target["done"]) == "完了")
+            e_done = st.checkbox("完了にする", value=str(target["状態"]) == "完了")
 
             col1, col2 = st.columns(2)
             with col1:
