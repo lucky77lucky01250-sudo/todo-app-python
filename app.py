@@ -31,9 +31,16 @@ def get_worksheet():
 
 
 def load_todos(ws):
-    """全Todoをデータフレームで取得する。"""
-    records = ws.get_all_records(expected_headers=HEADER)
-    df = pd.DataFrame(records, columns=HEADER)
+    """全Todoをデータフレームで取得する。
+
+    ヘッダーの文字に依存せず、2行目以降を列の位置で読む。
+    これによりヘッダー名が変わってもクラッシュしない。
+    """
+    values = ws.get_all_values()
+    rows = values[1:] if len(values) > 1 else []
+    # 各行を5列に揃える（欠けは空文字で補う）
+    normalized = [(row + [""] * len(HEADER))[: len(HEADER)] for row in rows]
+    df = pd.DataFrame(normalized, columns=HEADER)
     return df
 
 
