@@ -1,0 +1,10 @@
+# Streamlit secrets（認証情報は絶対にGitHubに上げない）
+.streamlit/secrets.toml
+service_account.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
