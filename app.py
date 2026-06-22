@@ -1,4 +1,5 @@
 import datetime
+import hmac
 import uuid
 
 import gspread
@@ -30,7 +31,8 @@ def check_password():
     pw = st.text_input("パスワード", type="password")
     if st.button("ログイン"):
         correct = st.secrets.get("auth", {}).get("password")
-        if correct and pw == correct:
+        # タイミング攻撃に強い比較
+        if correct and hmac.compare_digest(str(pw), str(correct)):
             st.session_state["authenticated"] = True
             st.rerun()
         else:
@@ -49,85 +51,145 @@ def get_worksheet():
     sheet = client.open_by_key(st.secrets["spreadsheet"]["key"])
     ws = sheet.sheet1
 
-    # 1行目のヘッダーが想定と違えば書き換える
-    if ws.row_values(1) != HEADER:
+    # 1行目が「空のときだけ」ヘッダーを作る。
+    # 既存データがある場合は絶対に上書きしない（データ破壊防止）。
+    if not ws.row_values(1):
         ws.update(values=[HEADER], range_name="A1:H1")
     return ws
 
 
-def load_todos(ws):
-    """全Todoをデータフレームで取得する。
+@st.cache_data(ttl=60, show_spinner=False)
+def load_todos():
+    """全Todoをデータフレームで取得する（60秒キャッシュ）。
 
     ヘッダーの文字に依存せず、2行目以降を列の位置で読む。
-    これによりヘッダー名や列数が変わってもクラッシュしない。
+    更新系の操作後は load_todos.clear() でキャッシュを破棄する。
     """
+    ws = get_worksheet()
     values = ws.get_all_values()
     rows = values[1:] if len(values) > 1 else []
-    # 各行を列数に揃える（欠けは空文字で補う）
     normalized = [(row + [""] * len(HEADER))[: len(HEADER)] for row in rows]
-    df = pd.DataFrame(normalized, columns=HEADER)
-    return df
+    return pd.DataFrame(normalized, columns=HEADER)
+
+
+def find_row_by_id(ws, todo_id):
+    """ID列(A列)を完全一致で探し、行番号(1始まり)を返す。無ければNone。"""
+    ids = ws.col_values(1)
+    for i, value in enumerate(ids):
+        if value == todo_id:
+            return i + 1
+    return None
 
 
 def add_todo(ws, title, content, due, priority, category):
     """新しいTodoを1行追加する。登録日は自動で本日を記録する。"""
     today = datetime.date.today().isoformat()
+    new_id = str(uuid.uuid4())  # 衝突しないフルUUID
     ws.append_row(
-        [str(uuid.uuid4())[:8], title, content, str(due), priority, category, "未完了", today]
+        [new_id, title, content, str(due), priority, category, "未完了", today]
     )
 
 
 def update_todo(ws, todo_id, title, content, due, priority, category, status):
-    """指定IDのTodoを更新する（登録日とIDは変更しない）。"""
-    cell = ws.find(todo_id, in_column=1)
-    row = cell.row
-    # B〜G列（タイトル・内容・期日・重要度・カテゴリ・状態）を更新
+    """指定IDのTodoを更新する（登録日とIDは変更しない）。見つからなければFalse。"""
+    row = find_row_by_id(ws, todo_id)
+    if row is None:
+        return False
     ws.update(
         values=[[title, content, str(due), priority, category, status]],
         range_name=f"B{row}:G{row}",
     )
+    return True
+
+
+def set_status(ws, todo_id, status):
+    """状態(G列)だけを更新する。見つからなければFalse。"""
+    row = find_row_by_id(ws, todo_id)
+    if row is None:
+        return False
+    ws.update(values=[[status]], range_name=f"G{row}")
+    return True
 
 
 def delete_todo(ws, todo_id):
-    """指定IDのTodoを削除する。"""
-    cell = ws.find(todo_id, in_column=1)
-    ws.delete_rows(cell.row)
+    """指定IDのTodoを削除する。見つからなければFalse。"""
+    row = find_row_by_id(ws, todo_id)
+    if row is None:
+        return False
+    ws.delete_rows(row)
+    return True
 
 
 def sort_todos(df, sort_key):
-    """並べ替え。重要度順または期日順。"""
+    """並べ替え。重要度順または期日順（期日なしは末尾）。"""
     df = df.copy()
+    df["_due"] = pd.to_datetime(df["期日"], errors="coerce")
     if sort_key == "重要度順":
-        df["_order"] = df["重要度"].map(PRIORITY_ORDER).fillna(99)
-        df = df.sort_values(["_order", "期日"]).drop(columns="_order")
-    elif sort_key == "期日順":
-        df = df.sort_values("期日")
+        df["_pri"] = df["重要度"].map(PRIORITY_ORDER).fillna(99)
+        df = df.sort_values(["_pri", "_due"], na_position="last")
+        df = df.drop(columns=["_pri", "_due"])
+    else:  # 期日順
+        df = df.sort_values("_due", na_position="last").drop(columns="_due")
     return df
 
 
-def render_todo_card(row):
-    """1件のTodoをカード表示する。"""
+def due_label(due_str):
+    """期日を「今日 / ●日遅れ / 明日」など強調表示にする。"""
+    due_str = str(due_str).strip()
+    if not due_str:
+        return ""
+    try:
+        d = datetime.date.fromisoformat(due_str)
+    except ValueError:
+        return f"📅 期日: {due_str}"
+    delta = (d - datetime.date.today()).days
+    if delta < 0:
+        return f"⚠️ {abs(delta)}日遅れ（{due_str}）"
+    if delta == 0:
+        return f"🔥 今日（{due_str}）"
+    if delta == 1:
+        return f"📅 明日（{due_str}）"
+    return f"📅 期日: {due_str}"
+
+
+def render_todo_card(row, ws=None, toggle=False):
+    """1件のTodoをカード表示する。toggle=Trueなら完了切替を付ける。"""
     done = str(row["状態"]) == "完了"
-    check = "✅" if done else "⬜️"
     pmark = PRIORITY_MARK.get(str(row["重要度"]), "")
     title = f"~~{row['タイトル']}~~" if done else f"**{row['タイトル']}**"
     with st.container(border=True):
-        st.markdown(f"{check} {pmark} {title}")
-        if row["内容"]:
-            st.write(row["内容"])
-        meta = []
-        if row["カテゴリ"]:
-            meta.append(f"🏷️ {row['カテゴリ']}")
-        if row["重要度"]:
-            meta.append(f"重要度: {row['重要度']}")
-        if row["期日"]:
-            meta.append(f"📅 期日: {row['期日']}")
-        if meta:
-            st.caption("　/　".join(meta))
+        if toggle and ws is not None:
+            c1, c2 = st.columns([0.1, 0.9])
+            with c1:
+                new = st.checkbox(
+                    "完了", value=done, key=f"chk_{row['ID']}",
+                    label_visibility="collapsed",
+                )
+            box = c2
+            if new != done:
+                if set_status(ws, row["ID"], "完了" if new else "未完了"):
+                    load_todos.clear()
+                st.rerun()
+        else:
+            box = st.container()
+
+        with box:
+            st.markdown(f"{pmark} {title}")
+            if row["内容"]:
+                st.write(row["内容"])
+            meta = []
+            if row["カテゴリ"]:
+                meta.append(f"🏷️ {row['カテゴリ']}")
+            if row["重要度"]:
+                meta.append(f"重要度: {row['重要度']}")
+            dl = due_label(row["期日"])
+            if dl:
+                meta.append(dl)
+            if meta:
+                st.caption("　/　".join(meta))
 
 
 # ===== 画面 =====
-# パスワードロック：認証が通るまで先へ進ませない
 if not check_password():
     st.stop()
 
@@ -146,13 +208,15 @@ tab_list, tab_add, tab_edit, tab_review = st.tabs(
 
 # --- 一覧ページ ---
 with tab_list:
-    df = load_todos(ws)
+    df = load_todos()
     if df.empty:
         st.info("まだやることが登録されていません。「新規登録」から追加してください。")
     else:
         col1, col2, col3 = st.columns(3)
         with col1:
-            cats = ["すべて"] + [c for c in CATEGORIES if c in df["カテゴリ"].values]
+            cats = ["すべて"] + sorted(
+                [c for c in df["カテゴリ"].unique() if str(c).strip()]
+            )
             f_cat = st.selectbox("カテゴリ", cats)
         with col2:
             f_status = st.selectbox("状態", ["すべて", "未完了のみ", "完了のみ"])
@@ -168,14 +232,20 @@ with tab_list:
             view = view[view["状態"] == "完了"]
         view = sort_todos(view, f_sort)
 
-        st.caption(f"表示 {len(view)} 件 / 全 {len(df)} 件")
+        st.caption(f"表示 {len(view)} 件 / 全 {len(df)} 件　（チェックで完了切替）")
         if view.empty:
             st.info("条件に合うやることがありません。")
         for _, row in view.iterrows():
-            render_todo_card(row)
+            render_todo_card(row, ws=ws, toggle=True)
 
 # --- 新規登録ページ ---
 with tab_add:
+    due_on = st.checkbox(
+        "期日を設定する",
+        value=True,
+        key="add_due_on",
+        help="毎日くり返すタスクなど、期日が不要ならOFFにしてください。",
+    )
     with st.form("add_form", clear_on_submit=True):
         title = st.text_input("タイトル *")
         content = st.text_area("内容")
@@ -184,29 +254,31 @@ with tab_add:
             priority = st.selectbox("重要度", PRIORITIES, index=1)
         with col2:
             category = st.selectbox("カテゴリ", CATEGORIES)
-        due_on = st.checkbox(
-            "期日を設定する",
-            value=True,
-            help="毎日くり返すタスクなど、期日が不要ならOFFにしてください。",
-        )
-        due_input = st.date_input("期日", value=datetime.date.today())
+        due_input = st.date_input("期日", value=datetime.date.today()) if due_on else None
         submitted = st.form_submit_button("登録する")
         if submitted:
             if not title.strip():
                 st.warning("タイトルは必須です。")
             else:
-                due = due_input if due_on else ""
-                add_todo(ws, title.strip(), content.strip(), due, priority, category)
-                st.success("登録しました！")
-                st.rerun()
+                due = due_input if (due_on and due_input) else ""
+                try:
+                    add_todo(ws, title.strip(), content.strip(), due, priority, category)
+                    load_todos.clear()
+                    st.success("登録しました！")
+                    st.rerun()
+                except Exception as e:
+                    st.error("登録に失敗しました。少し待って再度お試しください。")
+                    st.exception(e)
 
 # --- 編集・削除ページ ---
 with tab_edit:
-    df = load_todos(ws)
+    df = load_todos()
     if df.empty:
         st.info("編集できるやることがありません。")
     else:
-        options = {f"{r['タイトル']} ({r['ID']})": r["ID"] for _, r in df.iterrows()}
+        options = {
+            f"{r['タイトル']} ({str(r['ID'])[:8]})": r["ID"] for _, r in df.iterrows()
+        }
         selected_label = st.selectbox("編集するやることを選択", list(options.keys()))
         todo_id = options[selected_label]
         target = df[df["ID"] == todo_id].iloc[0]
@@ -219,7 +291,14 @@ with tab_edit:
         p_index = PRIORITIES.index(target["重要度"]) if target["重要度"] in PRIORITIES else 1
         c_index = CATEGORIES.index(target["カテゴリ"]) if target["カテゴリ"] in CATEGORIES else 0
 
-        with st.form("edit_form"):
+        # 期日ON/OFFはフォーム外（切替で即座に日付欄を出し入れするため）
+        e_due_on = st.checkbox(
+            "期日を設定する",
+            value=has_due,
+            key=f"edit_due_on_{todo_id}",
+            help="毎日くり返すタスクなど、期日が不要ならOFFにしてください。",
+        )
+        with st.form(f"edit_form_{todo_id}"):
             e_title = st.text_input("タイトル *", value=target["タイトル"])
             e_content = st.text_area("内容", value=target["内容"])
             col1, col2 = st.columns(2)
@@ -227,13 +306,9 @@ with tab_edit:
                 e_priority = st.selectbox("重要度", PRIORITIES, index=p_index)
             with col2:
                 e_category = st.selectbox("カテゴリ", CATEGORIES, index=c_index)
-            e_due_on = st.checkbox(
-                "期日を設定する",
-                value=has_due,
-                help="毎日くり返すタスクなど、期日が不要ならOFFにしてください。",
-            )
-            e_due_input = st.date_input("期日", value=due_value)
+            e_due_input = st.date_input("期日", value=due_value) if e_due_on else None
             e_done = st.checkbox("完了にする", value=str(target["状態"]) == "完了")
+            confirm_del = st.checkbox("削除を確認する（チェック後に削除ボタン）")
 
             col_u, col_d = st.columns(2)
             with col_u:
@@ -248,27 +323,45 @@ with tab_edit:
                     st.warning("タイトルは必須です。")
                 else:
                     status = "完了" if e_done else "未完了"
-                    e_due = e_due_input if e_due_on else ""
-                    update_todo(
-                        ws, todo_id, e_title.strip(), e_content.strip(),
-                        e_due, e_priority, e_category, status,
-                    )
-                    st.success("更新しました！")
-                    st.rerun()
+                    e_due = e_due_input if (e_due_on and e_due_input) else ""
+                    try:
+                        ok = update_todo(
+                            ws, todo_id, e_title.strip(), e_content.strip(),
+                            e_due, e_priority, e_category, status,
+                        )
+                        load_todos.clear()
+                        if ok:
+                            st.success("更新しました！")
+                        else:
+                            st.warning("対象が見つかりませんでした（すでに削除された可能性）。")
+                        st.rerun()
+                    except Exception as e:
+                        st.error("更新に失敗しました。少し待って再度お試しください。")
+                        st.exception(e)
 
             if delete_btn:
-                delete_todo(ws, todo_id)
-                st.success("削除しました！")
-                st.rerun()
+                if not confirm_del:
+                    st.warning("削除するには「削除を確認する」にチェックを入れてください。")
+                else:
+                    try:
+                        ok = delete_todo(ws, todo_id)
+                        load_todos.clear()
+                        if ok:
+                            st.success("削除しました！")
+                        else:
+                            st.warning("対象が見つかりませんでした（すでに削除済み）。")
+                        st.rerun()
+                    except Exception as e:
+                        st.error("削除に失敗しました。少し待って再度お試しください。")
+                        st.exception(e)
 
 # --- 振り返りページ ---
 with tab_review:
     st.subheader("📖 過去の振り返り")
-    df = load_todos(ws)
+    df = load_todos().copy()
     if df.empty:
         st.info("まだ記録がありません。")
     else:
-        # 登録日(YYYY-MM-DD)から「年月(YYYY-MM)」を作る
         df["年月"] = df["登録日"].astype(str).str.slice(0, 7)
         months = sorted([m for m in df["年月"].unique() if len(m) == 7], reverse=True)
         if not months:
@@ -278,14 +371,12 @@ with tab_review:
             month_df = df[df["年月"] == sel_month]
 
             st.markdown(f"### {sel_month} の記録")
-            # 達成度
             total = len(month_df)
             done_cnt = len(month_df[month_df["状態"] == "完了"])
             rate = int(done_cnt / total * 100) if total else 0
             st.metric("達成度", f"{done_cnt} / {total} 件", f"{rate}%")
             st.progress(rate / 100)
 
-            # カテゴリごとに表示
             for cat in CATEGORIES:
                 cat_df = month_df[month_df["カテゴリ"] == cat]
                 if cat_df.empty:
@@ -294,7 +385,6 @@ with tab_review:
                 for _, row in sort_todos(cat_df, "重要度順").iterrows():
                     render_todo_card(row)
 
-            # カテゴリ未設定の古いデータ
             other_df = month_df[~month_df["カテゴリ"].isin(CATEGORIES)]
             if not other_df.empty:
                 st.markdown("#### 🏷️ （カテゴリなし）")
