@@ -184,12 +184,18 @@ with tab_add:
             priority = st.selectbox("重要度", PRIORITIES, index=1)
         with col2:
             category = st.selectbox("カテゴリ", CATEGORIES)
-        due = st.date_input("期日", value=datetime.date.today())
+        due_on = st.checkbox(
+            "期日を設定する",
+            value=True,
+            help="毎日くり返すタスクなど、期日が不要ならOFFにしてください。",
+        )
+        due_input = st.date_input("期日", value=datetime.date.today())
         submitted = st.form_submit_button("登録する")
         if submitted:
             if not title.strip():
                 st.warning("タイトルは必須です。")
             else:
+                due = due_input if due_on else ""
                 add_todo(ws, title.strip(), content.strip(), due, priority, category)
                 st.success("登録しました！")
                 st.rerun()
@@ -205,6 +211,7 @@ with tab_edit:
         todo_id = options[selected_label]
         target = df[df["ID"] == todo_id].iloc[0]
 
+        has_due = bool(str(target["期日"]).strip())
         try:
             due_value = datetime.date.fromisoformat(str(target["期日"]))
         except ValueError:
@@ -220,7 +227,12 @@ with tab_edit:
                 e_priority = st.selectbox("重要度", PRIORITIES, index=p_index)
             with col2:
                 e_category = st.selectbox("カテゴリ", CATEGORIES, index=c_index)
-            e_due = st.date_input("期日", value=due_value)
+            e_due_on = st.checkbox(
+                "期日を設定する",
+                value=has_due,
+                help="毎日くり返すタスクなど、期日が不要ならOFFにしてください。",
+            )
+            e_due_input = st.date_input("期日", value=due_value)
             e_done = st.checkbox("完了にする", value=str(target["状態"]) == "完了")
 
             col_u, col_d = st.columns(2)
@@ -236,6 +248,7 @@ with tab_edit:
                     st.warning("タイトルは必須です。")
                 else:
                     status = "完了" if e_done else "未完了"
+                    e_due = e_due_input if e_due_on else ""
                     update_todo(
                         ws, todo_id, e_title.strip(), e_content.strip(),
                         e_due, e_priority, e_category, status,
