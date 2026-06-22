@@ -19,6 +19,25 @@ CATEGORIES = ["毎日のタスク", "今月の目標", "その他"]
 st.set_page_config(page_title="Todoリスト", page_icon="✅", layout="centered")
 
 
+# ===== パスワードロック（自分専用） =====
+def check_password():
+    """正しいパスワードを入力した人だけ通す。"""
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("🔒 ログイン")
+    st.caption("このアプリは本人専用です。パスワードを入力してください。")
+    pw = st.text_input("パスワード", type="password")
+    if st.button("ログイン"):
+        correct = st.secrets.get("auth", {}).get("password")
+        if correct and pw == correct:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("パスワードが違います。")
+    return False
+
+
 # ===== Googleスプレッドシート接続 =====
 @st.cache_resource(show_spinner=False)
 def get_worksheet():
@@ -108,6 +127,10 @@ def render_todo_card(row):
 
 
 # ===== 画面 =====
+# パスワードロック：認証が通るまで先へ進ませない
+if not check_password():
+    st.stop()
+
 st.title("✅ Todoリスト")
 
 try:
